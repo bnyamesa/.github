@@ -1,0 +1,328 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Finachub Reusable Plugin Pipeline
+#
+# Single source of truth for CI/CD across all Finachub plugins.
+# Called by each plugin's deploy.yml via:
+#   uses: YOUR_ORG/finachub-license-manager/.github/workflows/plugin-pipeline.yml@main
+#
+# Required repository secrets (inherited from the caller):
+#   HOST            — update server hostname
+#   USERNAME        — SSH username
+#   SSH_PRIVATE_KEY — SSH private key (PEM format)
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_call:
+    inputs:
+      slug:
+        description: Plugin directory slug (e.g. finachub-mobile-money)
+        required: true
+        type: string
+      main_file:
+        description: Main plugin PHP file (e.g. finachub-mobile-money.php)
+        required: true
+        type: string
+      plugin_name:
+        description: Human-readable plugin name for the update JSON
+        required: true
+        type: string
+      plugin_description:
+        description: Short description for the update JSON
+        required: true
+        type: string
+      phpstan_level:
+        description: PHPStan analysis level (0–9)
+        required: false
+        type: number
+        default: 0
+      phpstan_extra_args:
+        description: Extra arguments appended to the phpstan command
+        required: false
+        type: string
+        default: ''
+      update_server_base_url:
+        description: Public base URL where ZIPs and update JSONs are served
+        required: false
+        type: string
+        default: 'https://finachub.com/updates'
+      update_server_path:
+        description: Absolute path on the server where files are deployed
+        required: false
+        type: string
+        default: '/srv/www/wordpress/updates'
+
+# ── One concurrent run per plugin per ref. New push cancels the in-progress run.
+concurrency:
+  group: finachub-${{ inputs.slug }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ── 1. Code Quality ──────────────────────────────────────────────────────────
+  lint:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP 8.2
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          tools: composer:v2
+          coverage: none
+
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress --no-interaction
+
+      - name: PHPCS — Coding Standards
+        run: vendor/bin/phpcs -q --report=checkstyle .
+
+      - name: PHPStan — Static Analysis (level ${{ inputs.phpstan_level }})
+        run: >
+          vendor/bin/phpstan analyse
+          --no-progress
+          --level=${{ inputs.phpstan_level }}
+          ${{ inputs.phpstan_extra_args }}
+
+      - name: Composer Audit — Known CVEs
+        run: composer audit
+
+      - name: Composer Licenses — Compatibility Check
+        # Soft check: warn but don't block (no GPL-incompatible licenses expected)
+        run: composer licenses -f json | jq '.dependencies | to_entries[] | select(.value.license[] | test("proprietary|Commercial"; "i")) | .key' || true
+
+  # ── 2. Unit Tests (PHP matrix) ──────────────────────────────────────────────
+  test:
+    name: Tests — PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['7.4', '8.1', '8.2']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: composer:v2
+          coverage: none
+
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: ${{ runner.os }}-php${{ matrix.php }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: ${{ runner.os }}-php${{ matrix.php }}-composer-
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress --no-interaction
+
+      - name: Run PHPUnit
+        run: vendor/bin/phpunit -c phpunit-unit.xml
+
+  # ── 3. Build ─────────────────────────────────────────────────────────────────
+  build:
+    name: Build Plugin ZIP
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      version:  ${{ steps.version.outputs.version }}
+      zip_name: ${{ steps.version.outputs.zip_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # Full history needed for release notes
+
+      - name: Set up PHP 7.4
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '7.4'
+          tools: composer:v2
+          coverage: none
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION=$(grep "Version:" "${{ inputs.main_file }}" | awk '{print $3}')
+          fi
+          echo "version=${VERSION}"       >> $GITHUB_OUTPUT
+          echo "zip_name=${{ inputs.slug }}-${VERSION}.zip" >> $GITHUB_OUTPUT
+
+      - name: Verify tag matches plugin header version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          FILE_VERSION=$(grep "Version:" "${{ inputs.main_file }}" | awk '{print $3}')
+          if [ "$TAG_VERSION" != "$FILE_VERSION" ]; then
+            echo "::error::Tag version (${TAG_VERSION}) does not match plugin header version (${FILE_VERSION})"
+            exit 1
+          fi
+
+      - name: Install production dependencies
+        run: composer install --no-dev --optimize-autoloader --no-progress --no-interaction
+
+      - name: Assemble build directory
+        run: |
+          mkdir -p "build/${{ inputs.slug }}"
+          rsync -a \
+            --exclude=".git/" \
+            --exclude=".github/" \
+            --exclude="build/" \
+            --exclude="tests/" \
+            --exclude="vendor/" \
+            --exclude="phpunit*" \
+            --exclude="phpstan*" \
+            --exclude="phpcs*" \
+            --exclude="composer.*" \
+            --exclude="*.md" \
+            --exclude="updates.json" \
+            --exclude=".phpunit.result.cache" \
+            --exclude=".DS_Store" \
+            --exclude="*.txt" \
+            --exclude="Screenshot*" \
+            . "build/${{ inputs.slug }}/"
+
+          # Include production vendor only if non-empty
+          if [ -d vendor ] && [ "$(ls -A vendor 2>/dev/null)" ]; then
+            cp -r vendor "build/${{ inputs.slug }}/vendor"
+            find "build/${{ inputs.slug }}/vendor" -type d \( -name "tests" -o -name "docs" \) \
+              -exec rm -rf {} + 2>/dev/null || true
+          fi
+
+      - name: Create ZIP
+        run: |
+          cd build
+          zip -q -r "../${{ steps.version.outputs.zip_name }}" "${{ inputs.slug }}"
+
+      - name: Verify ZIP integrity
+        run: |
+          unzip -t "${{ steps.version.outputs.zip_name }}" > /dev/null
+          echo "ZIP integrity check passed."
+
+      - name: Generate update metadata
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ZIP_NAME="${{ steps.version.outputs.zip_name }}"
+          cat > "${{ inputs.slug }}-updates.json" <<EOF
+          {
+            "name":          "${{ inputs.plugin_name }}",
+            "slug":          "${{ inputs.slug }}",
+            "version":       "${VERSION}",
+            "download_url":  "${{ inputs.update_server_base_url }}/${ZIP_NAME}",
+            "requires":      "6.0",
+            "tested":        "6.7",
+            "requires_php":  "7.4",
+            "last_updated":  "$(date -u +'%Y-%m-%d %H:%M:%S')",
+            "sections": {
+              "description": "${{ inputs.plugin_description }}"
+            }
+          }
+          EOF
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          # Find the previous tag to build a log since last release
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null \
+            || git rev-list --max-parents=0 HEAD)
+          echo "Generating release notes since ${PREV_TAG}"
+          {
+            echo "## What's changed"
+            git log "${PREV_TAG}..HEAD" \
+              --pretty=format:"- %s" \
+              --no-merges \
+              | grep -v '^\- Merge' || echo "- Initial release"
+          } > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.slug }}-v${{ steps.version.outputs.version }}
+          path: |
+            ${{ steps.version.outputs.zip_name }}
+            ${{ inputs.slug }}-updates.json
+            RELEASE_NOTES.md
+          retention-days: 30
+
+  # ── 4. Deploy (tags only) ────────────────────────────────────────────────────
+  deploy:
+    name: Deploy Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: production        # Requires approval if configured in repo settings
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.slug }}-v${{ needs.build.outputs.version }}
+
+      - name: Prepare incoming directory on server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key:      ${{ secrets.SSH_PRIVATE_KEY }}
+          script:   mkdir -p ${{ inputs.update_server_path }}/.incoming
+
+      - name: Upload files to incoming directory
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host:     ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key:      ${{ secrets.SSH_PRIVATE_KEY }}
+          source:   "${{ needs.build.outputs.zip_name }},${{ inputs.slug }}-updates.json"
+          target:   "${{ inputs.update_server_path }}/.incoming/"
+
+      - name: Atomic swap — make files live
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key:      ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            mv "${{ inputs.update_server_path }}/.incoming/${{ needs.build.outputs.zip_name }}" \
+               "${{ inputs.update_server_path }}/${{ needs.build.outputs.zip_name }}"
+            mv "${{ inputs.update_server_path }}/.incoming/${{ inputs.slug }}-updates.json" \
+               "${{ inputs.update_server_path }}/${{ inputs.slug }}-updates.json"
+            echo "Files are live."
+
+      - name: Smoke test — verify update JSON is reachable
+        run: |
+          sleep 5
+          EXPECTED="${{ needs.build.outputs.version }}"
+          LIVE=$(curl -sf \
+            "${{ inputs.update_server_base_url }}/${{ inputs.slug }}-updates.json" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['version'])" \
+            2>/dev/null || echo "UNREACHABLE")
+          if [ "$LIVE" != "$EXPECTED" ]; then
+            echo "::error::Smoke test failed — expected version ${EXPECTED}, got ${LIVE}"
+            exit 1
+          fi
+          echo "Smoke test passed — v${LIVE} is live at ${{ inputs.update_server_base_url }}/${{ inputs.slug }}-updates.json"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          files: |
+            ${{ needs.build.outputs.zip_name }}
+            ${{ inputs.slug }}-updates.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
