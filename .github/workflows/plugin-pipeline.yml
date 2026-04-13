@@ -6,7 +6,7 @@
 #
 #   jobs:
 #     pipeline:
-#       uses: bnyamesa/.github/.github/workflows/plugin-pipeline.yml@main
+#       uses: bnyamesa/.github/.github/workflows/plugin-pipeline.yml@v1
 #       with:
 #         slug:        your-plugin-slug
 #         main_file:   your-plugin-file.php
@@ -77,17 +77,17 @@ jobs:
     name: Code Quality
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Set up PHP 8.2
-        uses: shivammathur/setup-php@v2
+        uses: shivammathur/setup-php@accd6127cb78bee3e8082180cb391013d204ef9f  # v2
         with:
           php-version: '8.2'
           tools: composer:v2
           coverage: none
 
       - name: Cache Composer packages
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: vendor
           key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
@@ -122,17 +122,17 @@ jobs:
       matrix:
         php: ['7.4', '8.1', '8.2']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Set up PHP ${{ matrix.php }}
-        uses: shivammathur/setup-php@v2
+        uses: shivammathur/setup-php@accd6127cb78bee3e8082180cb391013d204ef9f  # v2
         with:
           php-version: ${{ matrix.php }}
           tools: composer:v2
           coverage: none
 
       - name: Cache Composer packages
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: vendor
           key: ${{ runner.os }}-php${{ matrix.php }}-composer-${{ hashFiles('**/composer.lock') }}
@@ -153,12 +153,12 @@ jobs:
       version:  ${{ steps.version.outputs.version }}
       zip_name: ${{ steps.version.outputs.zip_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           fetch-depth: 0
 
       - name: Set up PHP 7.4
-        uses: shivammathur/setup-php@v2
+        uses: shivammathur/setup-php@accd6127cb78bee3e8082180cb391013d204ef9f  # v2
         with:
           php-version: '7.4'
           tools: composer:v2
@@ -258,7 +258,7 @@ jobs:
           } > RELEASE_NOTES.md
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ${{ inputs.slug }}-v${{ steps.version.outputs.version }}
           path: |
@@ -275,13 +275,26 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     environment: production
     steps:
+      - name: Validate required secrets
+        run: |
+          missing=()
+          [ -z "${{ secrets.HOST }}" ]            && missing+=("HOST")
+          [ -z "${{ secrets.USERNAME }}" ]         && missing+=("USERNAME")
+          [ -z "${{ secrets.SSH_PRIVATE_KEY }}" ]  && missing+=("SSH_PRIVATE_KEY")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing required secrets: ${missing[*]}"
+            echo "Set them under Settings → Secrets and variables → Actions in the plugin repo."
+            exit 1
+          fi
+          echo "All required secrets are present."
+
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: ${{ inputs.slug }}-v${{ needs.build.outputs.version }}
 
       - name: Prepare incoming directory on server
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262  # v1.0.3
         with:
           host:     ${{ secrets.HOST }}
           username: ${{ secrets.USERNAME }}
@@ -289,7 +302,7 @@ jobs:
           script:   mkdir -p ${{ inputs.update_server_path }}/.incoming
 
       - name: Upload files to incoming directory
-        uses: appleboy/scp-action@v0.1.7
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634  # v0.1.7
         with:
           host:     ${{ secrets.HOST }}
           username: ${{ secrets.USERNAME }}
@@ -298,7 +311,7 @@ jobs:
           target:   "${{ inputs.update_server_path }}/.incoming/"
 
       - name: Atomic swap and rotate old releases
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262  # v1.0.3
         with:
           host:     ${{ secrets.HOST }}
           username: ${{ secrets.USERNAME }}
@@ -308,6 +321,12 @@ jobs:
             UPDATES_DIR="${{ inputs.update_server_path }}"
             SLUG="${{ inputs.slug }}"
             ZIP_NAME="${{ needs.build.outputs.zip_name }}"
+
+            # Back up the current update JSON for rollback if smoke test fails
+            if [ -f "${UPDATES_DIR}/${SLUG}-updates.json" ]; then
+              cp "${UPDATES_DIR}/${SLUG}-updates.json" \
+                 "${UPDATES_DIR}/.incoming/${SLUG}-updates.json.prev"
+            fi
 
             # Atomic swap: move new files into the live directory
             mv "${UPDATES_DIR}/.incoming/${ZIP_NAME}" "${UPDATES_DIR}/${ZIP_NAME}"
@@ -321,21 +340,46 @@ jobs:
             echo "Release rotation complete. Keeping ${KEEP} most recent ZIPs."
 
       - name: Smoke test — verify update JSON is reachable and correct
+        id: smoke_test
         run: |
-          sleep 5
           EXPECTED="${{ needs.build.outputs.version }}"
-          LIVE=$(curl -sf \
-            "${{ inputs.update_server_base_url }}/${{ inputs.slug }}-updates.json" \
-            | python3 -c "import sys,json; print(json.load(sys.stdin)['version'])" \
-            2>/dev/null || echo "UNREACHABLE")
-          if [ "$LIVE" != "$EXPECTED" ]; then
-            echo "::error::Smoke test failed — expected v${EXPECTED}, got: ${LIVE}"
-            exit 1
-          fi
-          echo "Smoke test passed — v${LIVE} is live."
+          URL="${{ inputs.update_server_base_url }}/${{ inputs.slug }}-updates.json"
+          MAX_ATTEMPTS=10
+          WAIT=5
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            LIVE=$(curl -sf "$URL" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin)['version'])" \
+              2>/dev/null || echo "UNREACHABLE")
+            if [ "$LIVE" = "$EXPECTED" ]; then
+              echo "Smoke test passed — v${LIVE} is live. (attempt ${i}/${MAX_ATTEMPTS})"
+              exit 0
+            fi
+            echo "Attempt ${i}/${MAX_ATTEMPTS}: got '${LIVE}', expected '${EXPECTED}'. Retrying in ${WAIT}s..."
+            sleep $WAIT
+          done
+          echo "::error::Smoke test failed after ${MAX_ATTEMPTS} attempts — expected v${EXPECTED}, got: ${LIVE}"
+          exit 1
+
+      - name: Rollback on smoke test failure
+        if: failure() && steps.smoke_test.outcome == 'failure'
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262  # v1.0.3
+        with:
+          host:     ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key:      ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            UPDATES_DIR="${{ inputs.update_server_path }}"
+            SLUG="${{ inputs.slug }}"
+            PREV="${UPDATES_DIR}/.incoming/${SLUG}-updates.json.prev"
+            if [ -f "$PREV" ]; then
+              mv "$PREV" "${UPDATES_DIR}/${SLUG}-updates.json"
+              echo "Rollback complete: restored previous update JSON."
+            else
+              echo "No previous update JSON found — rollback skipped."
+            fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           body_path: RELEASE_NOTES.md
           files: |
