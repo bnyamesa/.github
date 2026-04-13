@@ -2,10 +2,19 @@
 # Finachub Reusable Plugin Pipeline
 #
 # Single source of truth for CI/CD across all Finachub plugins.
-# Called by each plugin's deploy.yml via:
-#   uses: YOUR_ORG/finachub-license-manager/.github/workflows/plugin-pipeline.yml@main
+# Lives in bnyamesa/.github — called by each plugin's deploy.yml:
 #
-# Required repository secrets (inherited from the caller):
+#   jobs:
+#     pipeline:
+#       uses: bnyamesa/.github/.github/workflows/plugin-pipeline.yml@main
+#       with:
+#         slug:        your-plugin-slug
+#         main_file:   your-plugin-file.php
+#         plugin_name: Your Plugin Name
+#         plugin_description: Short description.
+#       secrets: inherit
+#
+# Required repository secrets (set per plugin repo → Settings → Secrets):
 #   HOST            — update server hostname
 #   USERNAME        — SSH username
 #   SSH_PRIVATE_KEY — SSH private key (PEM format)
@@ -50,6 +59,11 @@ on:
         required: false
         type: string
         default: '/srv/www/wordpress/updates'
+      keep_releases:
+        description: Number of previous versioned ZIPs to keep on the server
+        required: false
+        type: number
+        default: 3
 
 # ── One concurrent run per plugin per ref. New push cancels the in-progress run.
 concurrency:
@@ -96,7 +110,6 @@ jobs:
         run: composer audit
 
       - name: Composer Licenses — Compatibility Check
-        # Soft check: warn but don't block (no GPL-incompatible licenses expected)
         run: composer licenses -f json | jq '.dependencies | to_entries[] | select(.value.license[] | test("proprietary|Commercial"; "i")) | .key' || true
 
   # ── 2. Unit Tests (PHP matrix) ──────────────────────────────────────────────
@@ -142,7 +155,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0    # Full history needed for release notes
+          fetch-depth: 0
 
       - name: Set up PHP 7.4
         uses: shivammathur/setup-php@v2
@@ -159,8 +172,8 @@ jobs:
           else
             VERSION=$(grep "Version:" "${{ inputs.main_file }}" | awk '{print $3}')
           fi
-          echo "version=${VERSION}"       >> $GITHUB_OUTPUT
-          echo "zip_name=${{ inputs.slug }}-${VERSION}.zip" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}"                                 >> $GITHUB_OUTPUT
+          echo "zip_name=${{ inputs.slug }}-${VERSION}.zip"        >> $GITHUB_OUTPUT
 
       - name: Verify tag matches plugin header version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -196,7 +209,6 @@ jobs:
             --exclude="Screenshot*" \
             . "build/${{ inputs.slug }}/"
 
-          # Include production vendor only if non-empty
           if [ -d vendor ] && [ "$(ls -A vendor 2>/dev/null)" ]; then
             cp -r vendor "build/${{ inputs.slug }}/vendor"
             find "build/${{ inputs.slug }}/vendor" -type d \( -name "tests" -o -name "docs" \) \
@@ -234,12 +246,9 @@ jobs:
           EOF
 
       - name: Generate release notes
-        id: release_notes
         run: |
-          # Find the previous tag to build a log since last release
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null \
             || git rev-list --max-parents=0 HEAD)
-          echo "Generating release notes since ${PREV_TAG}"
           {
             echo "## What's changed"
             git log "${PREV_TAG}..HEAD" \
@@ -247,7 +256,6 @@ jobs:
               --no-merges \
               | grep -v '^\- Merge' || echo "- Initial release"
           } > RELEASE_NOTES.md
-          cat RELEASE_NOTES.md
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -265,7 +273,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
-    environment: production        # Requires approval if configured in repo settings
+    environment: production
     steps:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
@@ -289,7 +297,7 @@ jobs:
           source:   "${{ needs.build.outputs.zip_name }},${{ inputs.slug }}-updates.json"
           target:   "${{ inputs.update_server_path }}/.incoming/"
 
-      - name: Atomic swap — make files live
+      - name: Atomic swap and rotate old releases
         uses: appleboy/ssh-action@v1.0.3
         with:
           host:     ${{ secrets.HOST }}
@@ -297,13 +305,22 @@ jobs:
           key:      ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             set -e
-            mv "${{ inputs.update_server_path }}/.incoming/${{ needs.build.outputs.zip_name }}" \
-               "${{ inputs.update_server_path }}/${{ needs.build.outputs.zip_name }}"
-            mv "${{ inputs.update_server_path }}/.incoming/${{ inputs.slug }}-updates.json" \
-               "${{ inputs.update_server_path }}/${{ inputs.slug }}-updates.json"
-            echo "Files are live."
+            UPDATES_DIR="${{ inputs.update_server_path }}"
+            SLUG="${{ inputs.slug }}"
+            ZIP_NAME="${{ needs.build.outputs.zip_name }}"
 
-      - name: Smoke test — verify update JSON is reachable
+            # Atomic swap: move new files into the live directory
+            mv "${UPDATES_DIR}/.incoming/${ZIP_NAME}" "${UPDATES_DIR}/${ZIP_NAME}"
+            mv "${UPDATES_DIR}/.incoming/${SLUG}-updates.json" "${UPDATES_DIR}/${SLUG}-updates.json"
+
+            # Rotate: keep only the N most recent versioned ZIPs for this slug
+            KEEP=${{ inputs.keep_releases }}
+            ls -t "${UPDATES_DIR}/${SLUG}"-*.zip 2>/dev/null \
+              | tail -n +$((KEEP + 1)) \
+              | xargs -r rm -f
+            echo "Release rotation complete. Keeping ${KEEP} most recent ZIPs."
+
+      - name: Smoke test — verify update JSON is reachable and correct
         run: |
           sleep 5
           EXPECTED="${{ needs.build.outputs.version }}"
@@ -312,10 +329,10 @@ jobs:
             | python3 -c "import sys,json; print(json.load(sys.stdin)['version'])" \
             2>/dev/null || echo "UNREACHABLE")
           if [ "$LIVE" != "$EXPECTED" ]; then
-            echo "::error::Smoke test failed — expected version ${EXPECTED}, got ${LIVE}"
+            echo "::error::Smoke test failed — expected v${EXPECTED}, got: ${LIVE}"
             exit 1
           fi
-          echo "Smoke test passed — v${LIVE} is live at ${{ inputs.update_server_base_url }}/${{ inputs.slug }}-updates.json"
+          echo "Smoke test passed — v${LIVE} is live."
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
