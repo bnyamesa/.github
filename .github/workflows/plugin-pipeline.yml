@@ -314,9 +314,9 @@ jobs:
           key:      ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             set -e
-            ZIP_URL="http://localhost/updates/${{ needs.build.outputs.zip_name }}"
+            ZIP_PATH="${{ inputs.staging_server_path }}/${{ needs.build.outputs.zip_name }}"
             WP_PATH="${{ inputs.staging_wp_path }}"
-            sudo -u www-data wp plugin install "${ZIP_URL}" \
+            sudo -u www-data wp plugin install "${ZIP_PATH}" \
               --force --activate --path="${WP_PATH}" 2>&1
             echo "Plugin ${{ inputs.slug }} v${{ needs.build.outputs.version }} active on staging."
 
